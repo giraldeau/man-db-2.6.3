@@ -1,0 +1,52 @@
+Description: Handle incompatible change to option string escaping in less 456
+Author: Colin Watson <cjwatson@debian.org>
+Origin: backport, http://bazaar.launchpad.net/~cjwatson/man-db/trunk/revision/1443
+Bug-Debian: http://bugs.debian.org/695459
+Forwarded: not-needed
+Last-Update: 2012-12-16
+
+Index: b/src/man.c
+===================================================================
+--- a/src/man.c
++++ b/src/man.c
+@@ -814,17 +814,35 @@
+ 	static char *escaped_string; 
+ 	char *ptr;
+ 
+-	/* 2*strlen will always be long enough to hold the escaped string */
++	/* 4*strlen will always be long enough to hold the escaped string */
+ 	ptr = escaped_string = xrealloc (escaped_string, 
+-					 2 * strlen (string) + 1);
+-	
++					 4 * strlen (string) + 1);
++
+ 	while (*string) {
++		/* less 456 requires dollar and backslash to be escaped in
++		 * the option string; this means that we need two
++		 * backslashes to effectively escape characters special in
++		 * prompt strings, and that displaying a backslash requires
++		 * two levels of escaping.  Note that this appears to be an
++		 * incompatible change, so this will overescape for earlier
++		 * versions of less.
++		 */
+ 		if (*string == '?' ||
+ 		    *string == ':' ||
+ 		    *string == '.' ||
+-		    *string == '%' ||
+-		    *string == '\\')
++		    *string == '%') {
++			/* Special only in prompt strings */
++			*ptr++ = '\\';
++			*ptr++ = '\\';
++		} else if (*string == '$')
++			/* Special only in option strings */
++			*ptr++ = '\\';
++		else if (*string == '\\') {
++			/* Special in both option and prompt strings */
++			*ptr++ = '\\';
++			*ptr++ = '\\';
+ 			*ptr++ = '\\';
++		}
+ 
+ 		*ptr++ = *string++;
+ 	}
