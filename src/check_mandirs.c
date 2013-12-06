@@ -316,12 +316,15 @@ void test_manfile (const char *file, const char *path)
 		free (lg.whatis);
 }
 
-static inline void add_dir_entries (const char *path, char *infile)
+static inline void add_dir_entries (const char *path, char *infile,
+									time_t last, time_t ulast)
 {
 	char *manpage;
 	int len;
 	struct dirent *newdir;
 	DIR *dir;
+	struct stat statbuf;
+	int fd, ret;
 
 	manpage = appendstr (NULL, path, "/", infile, "/", NULL);
 	len = strlen (manpage);
@@ -332,7 +335,17 @@ static inline void add_dir_entries (const char *path, char *infile)
 	 */
 
 	dir = opendir (infile);
-	if (!dir) {
+	if (dir) {
+#if _BSD_SOURCE
+		if ( (fd = dirfd (dir)) != -1)
+			ret = fchdir (fd);
+		else
+			ret = chdir (infile);
+#else
+		ret = chdir (infile);
+#endif
+	}
+	if (!dir || ret == -1) {
 		error (0, errno, _("can't search directory %s"), manpage);
 		free (manpage);
                 return;
@@ -343,12 +356,26 @@ static inline void add_dir_entries (const char *path, char *infile)
 	while ( (newdir = readdir (dir)) )
 		if (!(*newdir->d_name == '.' && 
 		      strlen (newdir->d_name) < (size_t) 3)) {
+#if _BSD_SOURCE
+			if (last)
+				lstat(newdir->d_name, &statbuf);
+			if (!last || last < statbuf.st_ctime ||
+				(last == statbuf.st_ctime
+				&& ulast < statbuf.st_ctim.tv_nsec)) {
+				manpage = appendstr (manpage, newdir->d_name, NULL);
+				test_manfile (manpage, path);
+				*(manpage + len) = '\0';
+			}
+
+#else
 			manpage = appendstr (manpage, newdir->d_name, NULL);
 			test_manfile (manpage, path);
 			*(manpage + len) = '\0';
+#endif
 		}
 		
 	free (manpage);
+	chdir ("..");
 	closedir (dir);
 }
 
@@ -425,13 +452,14 @@ static void mkcatdirs (const char *mandir, const char *catdir)
  * scanned for new files, which are then added to the db.
  */
 static int testmandirs (const char *path, const char *catpath, time_t last,
-			int create)
+			time_t ulast, int create)
 {
 	DIR *dir;
 	struct dirent *mandir;
 	struct stat stbuf;
 	int amount = 0;
 	int created = 0;
+	int fd;
 
 	debug ("Testing %s for new files\n", path);
 
@@ -441,7 +469,14 @@ static int testmandirs (const char *path, const char *catpath, time_t last,
 		return 0;
 	}
 
+#ifdef _BSD_SOURCE
+	if ( (fd = dirfd (dir)) != -1)
+		fchdir (fd);
+	else
+		chdir (path);
+#else
 	chdir (path);
+#endif
 
 	while( (mandir = readdir (dir)) ) {
 		if (strncmp (mandir->d_name, "man", 3) != 0)
@@ -453,14 +488,25 @@ static int testmandirs (const char *path, const char *catpath, time_t last,
 			continue;
 		if (!S_ISDIR(stbuf.st_mode))		/* not a directory */
 			continue;
-		if (last && stbuf.st_mtime <= last) {
+#if _BSD_SOURCE
+		if (last && (stbuf.st_mtime <= last
+				|| (stbuf.st_mtime == last
+					&& stbuf.st_mtim.tv_nsec < ulast))) {
 			/* scanned already */
 			debug ("%s modified %ld, db modified %ld\n",
 			       mandir->d_name, (long) stbuf.st_mtime,
 			       (long) last);
 			continue;
 		}
-
+#else
+		if (last && stbuf.st_mtime < last) {
+			/* scanned already */
+			debug ("%s modified %ld, db modified %ld\n",
+			       mandir->d_name, (long) stbuf.st_mtime,
+			       (long) last);
+			continue;
+		}
+#endif
 		debug ("\tsubdirectory %s has been 'modified'\n",
 		       mandir->d_name);
 
@@ -508,7 +554,7 @@ static int testmandirs (const char *path, const char *catpath, time_t last,
 			if (!tty)
 				fprintf (stderr, "\n");
 		}
-		add_dir_entries (path, mandir->d_name);
+		add_dir_entries (path, mandir->d_name, last, ulast);
 		MYDBM_CLOSE (dbf);
 		amount++;
 	}
@@ -520,11 +566,13 @@ static int testmandirs (const char *path, const char *catpath, time_t last,
 /* update the time key stored within `database' */
 void update_db_time (void)
 {
+	struct timeval tv;
 	datum key, content;
 #ifdef FAST_BTREE
 	datum key1, content1;
 #endif /* FAST_BTREE */
 
+	gettimeofday (&tv, NULL);
 	memset (&key, 0, sizeof key);
 	memset (&content, 0, sizeof content);
 #ifdef FAST_BTREE
@@ -533,7 +581,8 @@ void update_db_time (void)
 #endif
 
 	MYDBM_SET (key, xstrdup (KEY));
-	MYDBM_SET (content, xasprintf ("%ld", (long) time (NULL)));
+	MYDBM_SET (content, xasprintf ("%ld.%09d", (long) tv.tv_sec,
+									(int) tv.tv_usec));
 
 	/* Open the db in RW to store the $mtime$ ID */
 	/* we know that this should succeed because we just updated the db! */
@@ -595,7 +644,7 @@ int create_db (const char *manpath, const char *catpath)
 	
 	debug ("create_db(%s): %s\n", manpath, database);
 
-	amount = testmandirs (manpath, catpath, (time_t) 0, 1);
+	amount = testmandirs (manpath, catpath, (time_t) 0, (time_t) 0, 1);
 
 	if (amount) {
 		update_db_time ();
@@ -646,6 +695,8 @@ int update_db (const char *manpath, const char *catpath)
 	if (dbf) {
 		datum key, content;
 		int new;
+		long sec;
+		int usec;
 
 		memset (&key, 0, sizeof key);
 		memset (&content, 0, sizeof content);
@@ -654,16 +705,23 @@ int update_db (const char *manpath, const char *catpath)
 		content = MYDBM_FETCH (dbf, key);
 		MYDBM_CLOSE (dbf);
 		free (MYDBM_DPTR (key));
+		if (MYDBM_DPTR (content)) {
+				char *end;
+				sec = strtol (MYDBM_DPTR (content), &end, 10);
+				usec = *end == '.' ? strtol (end+1, NULL, 10) : 0;
+		} else {
+				sec = usec = 0;
+		}
 
 		debug ("update_db(): %ld\n",
 		       MYDBM_DPTR (content) ? atol (MYDBM_DPTR (content)) : 0L);
 		if (MYDBM_DPTR (content)) {
 			new = testmandirs (
 				manpath, catpath,
-				(time_t) atol (MYDBM_DPTR (content)), 0);
+				(time_t) sec, (time_t) usec, 0);
 			MYDBM_FREE (MYDBM_DPTR (content));
 		} else
-			new = testmandirs (manpath, catpath, (time_t) 0, 0);
+			new = testmandirs (manpath, catpath, (time_t) 0, (time_t) 0, 0);
 
 		if (new) {
 			update_db_time ();
